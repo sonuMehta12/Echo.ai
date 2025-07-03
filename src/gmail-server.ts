@@ -1,3 +1,5 @@
+// src/gmail-server.ts
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -37,7 +39,6 @@ async function authorize(): Promise<gmail_v1.Gmail> {
   const { client_id, client_secret, redirect_uris } = credentials.installed || credentials.web;
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-  // Try to load token
   try {
     const token = await fs.readFile(TOKEN_PATH, "utf-8");
     oAuth2Client.setCredentials(JSON.parse(token));
@@ -58,7 +59,6 @@ function decodeEmailBody(part: gmail_v1.Schema$MessagePart): string {
     if (textPart) {
       return decodeEmailBody(textPart);
     }
-    // If no text/plain, try text/html
     const htmlPart = part.parts.find(p => p.mimeType === "text/html");
     if (htmlPart) {
       return decodeEmailBody(htmlPart);
@@ -202,6 +202,20 @@ server.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsReques
           required: ["thread_id"],
         },
       },
+      {
+        name: "quality_check",
+        description: "Analyzes a piece of text for professionalism, politeness, and clarity.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            text: {
+              type: "string",
+              description: "The text content to be analyzed."
+            }
+          },
+          required: ["text"],
+        },
+      },
     ],
   };
 });
@@ -209,12 +223,12 @@ server.setRequestHandler(ListToolsRequestSchema, async (request: ListToolsReques
 // --- Tool Logic ---
 server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
   try {
-    const gmail = await authorize();
     const { name, arguments: args } = request.params;
     const toolArgs = args as Record<string, any>;
 
     switch (name) {
       case "list_emails": {
+        const gmail = await authorize();
         const query = toolArgs.query || "is:inbox";
         const maxResults = toolArgs.max_results || 10;
         
@@ -261,6 +275,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "read_email": {
+        const gmail = await authorize();
         const messageId = toolArgs.message_id;
         if (!messageId) {
           throw new Error("message_id is required");
@@ -291,6 +306,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "create_draft": {
+        const gmail = await authorize();
         const { to, subject, body, in_reply_to } = toolArgs;
         
         if (!to || !subject || !body) {
@@ -324,6 +340,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "send_email": {
+        const gmail = await authorize();
         const { to, subject, body } = toolArgs;
         
         if (!to || !subject || !body) {
@@ -354,6 +371,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case "summarize_thread": {
+        const gmail = await authorize();
         const threadId = toolArgs.thread_id;
         if (!threadId) {
           throw new Error("thread_id is required");
@@ -408,6 +426,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             type: "text", 
             text: `EMAIL THREAD SUMMARY:\n\n${summary}` 
           }] 
+        };
+      }
+
+      case "quality_check": {
+        const text = toolArgs.text;
+        if (!text) {
+          throw new Error("text is required");
+        }
+
+        console.error("[Server] Performing quality_check via OpenAI API...");
+        
+        const qualityResponse = await openai.chat.completions.create({
+          model: "gpt-4-turbo-preview",
+          messages: [
+            {
+              role: "system",
+              content: "You are a communication quality assurance expert. Analyze the following text. Is it polite, professional, and free of harsh or demanding language? Respond with a single word 'OK' if it passes. If it fails, respond with 'REJECTED' followed by a colon and a brief, one-sentence explanation of what needs to be improved (e.g., 'REJECTED: The tone is too demanding.')."
+            },
+            {
+              role: "user",
+              content: text
+            },
+          ],
+          max_tokens: 100,
+          temperature: 0.1,
+        });
+
+        const verdict = qualityResponse.choices[0].message.content || "Error: Could not get a verdict.";
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: verdict,
+            },
+          ],
         };
       }
 

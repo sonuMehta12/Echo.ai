@@ -2,9 +2,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 async function main() {
-  console.log("🔄 Starting Gmail MCP server...");
+  console.log("🔄 Starting Gmail MCP server for testing...");
   
-  // Create transport with the correct parameters for the newer SDK
+  // This is the correct way to use StdioClientTransport to spawn a process.
   const transport = new StdioClientTransport({
     command: "node",
     args: ["build/gmail-server.js"],
@@ -25,78 +25,61 @@ async function main() {
     await client.connect(transport);
     console.log("✅ Connected successfully!");
 
-    // Test 1: List available tools
+    // Test 1: List available tools to confirm 'quality_check' is present
     console.log("\n📋 Listing available tools...");
     const tools = await client.listTools();
-    console.log("Available tools:", tools.tools.map(t => t.name).join(", "));
+    const toolNames = tools.tools.map(t => t.name);
+    console.log("Available tools:", toolNames.join(", "));
+    if (!toolNames.includes('quality_check')) {
+        throw new Error("TEST FAILED: quality_check tool is not registered!");
+    }
+    console.log("✅ 'quality_check' tool is available.");
 
-    // Test 2: List emails
-    console.log("\n📧 Testing list_emails with query 'is:unread'...");
+    // --- NEW: Test cases for the quality_check tool ---
+
+    // Test 2: A good, professional message
+    console.log("\n🧪 Testing quality_check with a GOOD message...");
     try {
+      const goodText = "Hello team, just a friendly reminder that the reports are due by 5 PM today. Please let me know if you have any questions. Thanks!";
       const result = await client.callTool({
-        name: "list_emails",
-        arguments: { 
-          query: "is:unread", 
-          max_results: 5 
-        },
+        name: "quality_check",
+        arguments: { text: goodText },
       });
 
-      console.log("\n--- Email List Results ---");
-      if (Array.isArray(result.content) && result.content[0] && "text" in result.content[0]) {
-        console.log((result.content[0] as { text: string }).text);
-      } else {
-        console.log("Unexpected response format:", JSON.stringify(result, null, 2));
+      console.log("--- Quality Check Result (Good Text) ---");
+      const verdict = (result.content as any)[0].text;
+      console.log(`Verdict: ${verdict}`);
+      if (verdict !== 'OK') {
+          throw new Error(`TEST FAILED: Expected 'OK', but got '${verdict}'`);
       }
-      console.log("-------------------------\n");
+      console.log("✅ PASSED: Good text was approved correctly.");
+      console.log("----------------------------------------\n");
+
     } catch (error) {
-      console.error("❌ Error listing emails:", error);
+      console.error("❌ FAILED: Error during good text quality check:", error);
     }
 
-    // Test 3: List inbox emails (alternative test)
-    console.log("\n📧 Testing list_emails with default inbox query...");
+    // Test 3: A harsh, unprofessional message
+    console.log("🧪 Testing quality_check with a BAD message...");
     try {
+      const badText = "Why are your reports late again? I need them on my desk NOW.";
       const result = await client.callTool({
-        name: "list_emails",
-        arguments: { 
-          max_results: 3 
-        },
+        name: "quality_check",
+        arguments: { text: badText },
       });
 
-      console.log("\n--- Inbox Results ---");
-      if (Array.isArray(result.content) && result.content[0] && "text" in result.content[0]) {
-        console.log((result.content[0] as { text: string }).text);
-      } else {
-        console.log("Unexpected response format:", JSON.stringify(result, null, 2));
+      console.log("--- Quality Check Result (Bad Text) ---");
+      const verdict = (result.content as any)[0].text;
+      console.log(`Verdict: ${verdict}`);
+      if (!verdict.startsWith('REJECTED')) {
+          throw new Error(`TEST FAILED: Expected 'REJECTED', but got '${verdict}'`);
       }
-      console.log("--------------------\n");
-    } catch (error) {
-      console.error("❌ Error listing inbox emails:", error);
-    }
+      console.log("✅ PASSED: Bad text was rejected correctly.");
+      console.log("---------------------------------------\n");
 
-    // Test 4: Create a draft (commented out to avoid actually creating drafts during testing)
-    /*
-    console.log("\n✏️  Testing create_draft...");
-    try {
-      const result = await client.callTool({
-        name: "create_draft",
-        arguments: {
-          to: "test@example.com",
-          subject: "Test Draft from MCP",
-          body: "This is a test draft created by the Gmail MCP server."
-        },
-      });
-
-      console.log("\n--- Draft Creation Result ---");
-      if (result.content && result.content[0] && "text" in result.content[0]) {
-        console.log(result.content[0].text);
-      } else {
-        console.log("Unexpected response format:", JSON.stringify(result, null, 2));
-      }
-      console.log("-----------------------------\n");
     } catch (error) {
-      console.error("❌ Error creating draft:", error);
+      console.error("❌ FAILED: Error during bad text quality check:", error);
     }
-    */
 
     console.log("🎉 All tests completed!");
 
@@ -105,18 +88,14 @@ async function main() {
   } finally {
     console.log("\n🔌 Closing connection...");
     await client.close();
-    console.log("✅ Connection closed.");
+    // The transport automatically handles terminating the child process.
+    console.log("✅ Connection closed and server terminated.");
   }
 }
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n⏹️  Received SIGINT, shutting down...');
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n⏹️  Received SIGTERM, shutting down...');
   process.exit(0);
 });
 
