@@ -1,7 +1,0 @@
-Welcome to the MCP Filesystem Client!
-
-This is a test file created automatically.
-Try commands like:
-- read the file named welcome.txt
-- create a new file
-- list directory contents
