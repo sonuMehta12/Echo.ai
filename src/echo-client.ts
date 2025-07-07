@@ -85,6 +85,8 @@ class FilesystemMCPClient {
         args: [serverPath, rootDirectory],
       });
 
+      
+
       // Connect to server
       await this.client.connect(this.transport);
       
@@ -321,7 +323,6 @@ Always use relative paths from the root directory. Be helpful and explain what y
   }
 }
 
-// Main function
 async function main() {
   const args = process.argv.slice(2);
   

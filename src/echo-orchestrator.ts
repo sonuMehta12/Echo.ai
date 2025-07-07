@@ -7,6 +7,14 @@ import dotenv from "dotenv";
 import path from "path";
 import { promises as fs } from "fs";
 
+// --- NEW: LangChain/LangGraph Imports ---
+import { ChatOpenAI } from "@langchain/openai";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { HumanMessage } from "@langchain/core/messages";
+import { DynamicTool } from "@langchain/core/tools";
+import { MemorySaver } from "@langchain/langgraph";
+
+
 // Load environment variables
 dotenv.config();
 
@@ -14,11 +22,12 @@ dotenv.config();
  * Configuration and constants
  */
 const CONFIG = {
-  OPENAI_MODEL: "gpt-4-turbo-preview",
+  OPENAI_MODEL: "o4-mini", // Using a more powerful model for agentic work
   WORKSPACE_DIR: "./echo-workspace",
   SERVER_PATHS: {
     FILESYSTEM: "build/filesystem-server.js",
-    GMAIL: "build/gmail-server.js"
+    GMAIL: "build/gmail-server.js",
+    SEARCH: "build/search-server.js", // --- NEW: Path to the search server ---
   }
 } as const;
 
@@ -41,7 +50,7 @@ interface AggregatedTool {
   name: string;
   description?: string;
   inputSchema: any;
-  source: 'filesystem' | 'gmail';
+  source: 'filesystem' | 'gmail' | 'search'; // --- UPDATED: Added 'search' ---
 }
 
 /**
@@ -60,22 +69,27 @@ interface ServiceConfig {
   fsServerPath: string;
   fsRoot: string;
   gmailServerPath: string;
+  searchServerPath: string; // --- NEW: Added search server path ---
 }
 
 /**
  * Echo AI Orchestrator - Manages multiple AI services and provides a unified interface
  * 
- * This class coordinates between filesystem operations, Gmail operations, and OpenAI
- * to provide an intelligent assistant that can perform complex multi-step tasks.
+ * This class coordinates between filesystem operations, Gmail operations, search operations,
+ * and OpenAI to provide an intelligent assistant that can perform complex multi-step tasks
+ * using LangGraph for advanced reasoning and planning.
  */
 class EchoOrchestrator {
   private fsServerProcess: ChildProcess | null = null;
   private gmailServerProcess: ChildProcess | null = null;
+  private searchServerProcess: ChildProcess | null = null; // --- NEW ---
   private fsClient: Client;
   private gmailClient: Client;
+  private searchClient: Client; // --- NEW ---
   private openai: OpenAI;
   private tools: AggregatedTool[] = [];
   private isConnected = false;
+  private agent: any; // --- NEW: LangGraph agent ---
 
   /**
    * Initializes the orchestrator with required clients
@@ -89,6 +103,10 @@ class EchoOrchestrator {
     });
     this.gmailClient = new Client({ 
       name: "orchestrator-gmail-client", 
+      version: "1.0.0" 
+    });
+    this.searchClient = new Client({ // --- NEW ---
+      name: "orchestrator-search-client", 
       version: "1.0.0" 
     });
     this.openai = new OpenAI({ apiKey });
@@ -105,10 +123,14 @@ class EchoOrchestrator {
       
       await this.connectFilesystemService(config.fsServerPath, config.fsRoot);
       await this.connectGmailService(config.gmailServerPath);
+      await this.connectSearchService(config.searchServerPath); // --- NEW ---
       await this.aggregateTools();
       
+      // --- NEW: Initialize the LangGraph agent after tools are ready ---
+      this.initializeAgent();
+      
       this.isConnected = true;
-      console.log(`✅ Orchestrator ready. Total tools available: ${this.tools.length}`);
+      console.log(`✅ Orchestrator ready. LangGraph agent initialized with ${this.tools.length} tools.`);
     } catch (error) {
       console.error("[Orchestrator] Failed to connect to services:", error);
       await this.disconnect();
@@ -149,14 +171,31 @@ class EchoOrchestrator {
   }
 
   /**
+   * --- NEW: Establishes connection to the search service ---
+   */
+  private async connectSearchService(serverPath: string): Promise<void> {
+    console.log("[Orchestrator] Connecting to search service...");
+    
+    this.searchServerProcess = spawn("node", [serverPath]);
+    const transport = new StdioClientTransport({ 
+      command: "node", 
+      args: [serverPath] 
+    });
+    
+    await this.searchClient.connect(transport);
+    console.log("✅ Search service connected");
+  }
+
+  /**
    * Collects and aggregates tools from all connected services
    */
   private async aggregateTools(): Promise<void> {
     console.log("[Orchestrator] Aggregating tools from all services...");
     
-    const [fsToolsResponse, gmailToolsResponse] = await Promise.all([
+    const [fsToolsResponse, gmailToolsResponse, searchToolsResponse] = await Promise.all([
       this.fsClient.listTools(),
-      this.gmailClient.listTools()
+      this.gmailClient.listTools(),
+      this.searchClient.listTools() // --- NEW ---
     ]);
 
     const fsTools: AggregatedTool[] = fsToolsResponse.tools.map(tool => ({ 
@@ -167,181 +206,126 @@ class EchoOrchestrator {
       ...tool, 
       source: 'gmail' 
     }));
+    const searchTools: AggregatedTool[] = searchToolsResponse.tools.map(tool => ({ // --- NEW ---
+      ...tool, 
+      source: 'search' 
+    }));
 
-    this.tools = [...fsTools, ...gmailTools];
+    this.tools = [...fsTools, ...gmailTools, ...searchTools];
   }
 
   /**
-   * Processes a user query by planning, executing tools, and summarizing results
-   * @param query - The user's natural language query
+   * --- NEW: Initialize the LangGraph Agent ---
    */
-  public async processQuery(query: string): Promise<void> {
-    if (!this.isConnected) {
-      console.error("❌ Cannot process query: Not connected to services");
+  private initializeAgent(): void {
+    console.log("[Orchestrator] Initializing LangGraph agent...");
+
+    // Create LangChain-compatible tools that act as proxies to our MCP services
+    const langChainTools = this.tools.map(toolDef => {
+      return new DynamicTool({
+        name: toolDef.name,
+        description: toolDef.description || "No description available.",
+        func: async (input: string | Record<string, any>): Promise<string> => {
+          // This function is the bridge between LangGraph and our MCP clients
+          let args: any;
+          
+          // Handle different input formats
+          if (typeof input === 'string') {
+            // If it's a string, try to parse as JSON, otherwise use as query
+            try {
+              args = JSON.parse(input);
+            } catch {
+              args = { query: input };
+            }
+          } else {
+            args = input;
+          }
+          
+          // Route to the correct client based on tool source
+          let client: Client;
+          switch (toolDef.source) {
+            case 'filesystem':
+              client = this.fsClient;
+              break;
+            case 'gmail':
+              client = this.gmailClient;
+              break;
+            case 'search':
+              client = this.searchClient;
+              break;
+          }
+          
+          try {
+            console.log(`[LangGraph] Executing ${toolDef.source}.${toolDef.name}...`);
+            const result = await client.callTool({ 
+              name: toolDef.name, 
+              arguments: args 
+            });
+            
+            const resultText = this.extractResultText(result);
+            console.log(`[LangGraph] ✅ ${toolDef.name} completed`);
+            return resultText;
+          } catch (error: any) {
+            const errorMsg = `Error executing tool ${toolDef.name}: ${error.message}`;
+            console.error(`[LangGraph] ❌ ${errorMsg}`);
+            return errorMsg;
+          }
+        },
+      });
+    });
+
+    // Initialize the LangChain ChatOpenAI model
+    const llm = new ChatOpenAI({ 
+      modelName: CONFIG.OPENAI_MODEL, 
+      temperature: 1 // Keep it focused but allow some creativity
+    });
+
+    // Create the ReAct agent using LangGraph's prebuilt agent
+    const agentCheckpointer = new MemorySaver()
+    this.agent = createReactAgent({
+      llm,
+      tools: langChainTools,
+      messageModifier: this.getSystemPrompt(), // Use our custom system prompt
+      checkpointSaver: agentCheckpointer,
+
+    });
+
+    console.log("✅ LangGraph agent initialized");
+  }
+
+  /**
+   * --- REFACTORED: processQuery now uses the LangGraph agent ---
+   */
+  public async processQuery(query: string, threadId?: string): Promise<void> {
+    if (!this.isConnected || !this.agent) {
+      console.error("❌ Cannot process query: Orchestrator not ready.");
       return;
     }
 
     console.log(`\n🤔 Processing query: "${query}"`);
 
     try {
-      const messages = this.initializeConversation(query);
-      const planningResponse = await this.generateExecutionPlan(messages);
+      // Create a unique thread ID if not provided
+      const currentThreadId = threadId || `thread_${Date.now()}`;
       
-      messages.push(planningResponse);
+      // Invoke the LangGraph agent with the user's query
+      const finalState = await this.agent.invoke(
+        { messages: [new HumanMessage(query)] },
+        { 
+          configurable: { thread_id: currentThreadId },
+          recursionLimit: 20 // Prevent infinite loops
+        }
+      );
 
-      if (planningResponse.tool_calls) {
-        await this.executeToolCalls(planningResponse.tool_calls, messages);
-        await this.generateFinalResponse(messages);
-      } else {
-        console.log("\n✅ Echo says:", planningResponse.content);
-      }
+      // Extract the final response from the agent
+      const lastMessage = finalState.messages[finalState.messages.length - 1];
+      const responseContent = lastMessage.content;
+
+      console.log("\n✅ Echo says:", responseContent);
     } catch (error) {
-      console.error("❌ Error processing query:", error);
+      console.error("❌ Error during agent execution:", error);
+      console.log("\n❌ I encountered an error while processing your request. Please try again or rephrase your question.");
     }
-  }
-
-  /**
-   * Initializes the conversation context for a new query
-   */
-  private initializeConversation(query: string): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-    return [
-      { role: "system", content: this.getSystemPrompt() },
-      { role: "user", content: query }
-    ];
-  }
-
-  /**
-   * Generates an execution plan using OpenAI
-   */
-  private async generateExecutionPlan(
-    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
-  ): Promise<OpenAI.Chat.Completions.ChatCompletionMessage> {
-    const openaiTools = this.convertToolsToOpenAIFormat();
-    
-    const response = await this.openai.chat.completions.create({
-      model: CONFIG.OPENAI_MODEL,
-      messages,
-      tools: openaiTools,
-      tool_choice: "auto"
-    });
-
-    return response.choices[0].message;
-  }
-
-  /**
-   * Converts internal tool format to OpenAI function calling format
-   */
-  private convertToolsToOpenAIFormat() {
-    return this.tools.map(tool => ({
-      type: "function" as const,
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.inputSchema
-      }
-    }));
-  }
-
-  /**
-   * Executes a series of tool calls and adds results to conversation
-   */
-  private async executeToolCalls(
-    toolCalls: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[],
-    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
-  ): Promise<void> {
-    console.log("⚙️ Executing planned tools...");
-
-    for (const toolCall of toolCalls) {
-      const result = await this.executeToolCall(toolCall);
-      
-      messages.push({
-        tool_call_id: toolCall.id,
-        role: "tool",
-        content: result.content
-      });
-    }
-  }
-
-  /**
-   * Executes a single tool call
-   */
-  private async executeToolCall(
-    toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall
-  ): Promise<ToolExecutionResult> {
-    const { name: toolName, arguments: toolArgsString } = toolCall.function;
-    
-    try {
-      const toolArgs = JSON.parse(toolArgsString);
-      const toolDefinition = this.findTool(toolName);
-      
-      if (!toolDefinition) {
-        const error = `Unknown tool: ${toolName}`;
-        console.error(`❌ ${error}`);
-        return { success: false, content: `Error: ${error}` };
-      }
-
-      console.log(`  - Executing ${toolDefinition.source}.${toolName}...`);
-      
-      const result = await this.callTool(toolDefinition, toolName, toolArgs);
-      const resultText = this.extractResultText(result);
-      
-      console.log(`  - ✅ Success: ${this.truncateText(resultText, 100)}`);
-      return { success: true, content: resultText };
-      
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`  - ❌ Error executing ${toolName}:`, errorMessage);
-      return { success: false, content: `Error: ${errorMessage}` };
-    }
-  }
-
-  /**
-   * Finds a tool by name in the aggregated tools list
-   */
-  private findTool(toolName: string): AggregatedTool | undefined {
-    return this.tools.find(tool => tool.name === toolName);
-  }
-
-  /**
-   * Calls the appropriate service client based on tool source
-   */
-  private async callTool(
-    toolDefinition: AggregatedTool, 
-    toolName: string, 
-    toolArgs: any
-  ): Promise<any> {
-    const client = toolDefinition.source === 'filesystem' ? this.fsClient : this.gmailClient;
-    return await client.callTool({ name: toolName, arguments: toolArgs });
-  }
-
-  /**
-   * Extracts text content from tool execution result
-   */
-  private extractResultText(result: any): string {
-    return (result.content as any)?.[0]?.text || JSON.stringify(result);
-  }
-
-  /**
-   * Truncates text to specified length with ellipsis
-   */
-  private truncateText(text: string, maxLength: number): string {
-    return text.length > maxLength ? `${text.substring(0, maxLength)}...` : text;
-  }
-
-  /**
-   * Generates final response by asking LLM to summarize results
-   */
-  private async generateFinalResponse(
-    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
-  ): Promise<void> {
-    console.log("💬 Generating final response...");
-    
-    const response = await this.openai.chat.completions.create({
-      model: CONFIG.OPENAI_MODEL,
-      messages
-    });
-
-    console.log("\n✅ Echo says:", response.choices[0].message.content);
   }
 
   /**
@@ -353,7 +337,10 @@ class EchoOrchestrator {
       output: process.stdout
     });
 
-    this.displayWelcomeMessage();
+    // Create a unique thread ID for this conversation session
+    const threadId = `thread_${Date.now()}`;
+    
+    this.displayWelcomeMessage(threadId);
 
     try {
       while (true) {
@@ -367,7 +354,7 @@ class EchoOrchestrator {
           continue;
         }
 
-        await this.processQuery(query);
+        await this.processQuery(query, threadId);
       }
     } finally {
       rl.close();
@@ -377,13 +364,19 @@ class EchoOrchestrator {
   /**
    * Displays welcome message and usage instructions
    */
-  private displayWelcomeMessage(): void {
-    console.log("\n" + "=".repeat(40));
-    console.log("🚀 Echo AI Assistant is Ready!");
-    console.log("=".repeat(40));
-    console.log("Try commands like:");
-    console.log("  • 'What tools can you use?'");
-    console.log("  • 'Find my latest unread email and save it to latest.txt'");
+  private displayWelcomeMessage(threadId: string): void {
+    console.log("\n" + "=".repeat(50));
+    console.log("🚀 Echo AI Assistant (LangGraph Edition) is Ready!");
+    console.log("=".repeat(50));
+    console.log(`Conversation ID: ${threadId}`);
+    console.log("Available capabilities:");
+    console.log("  📁 File operations (read, write, list, etc.)");
+    console.log("  📧 Email management (read, send, search)");
+    console.log("  🔍 Web search (current events, research)");
+    console.log("\nTry commands like:");
+    console.log("  • 'What is the current status of the James Webb telescope?'");
+    console.log("  • 'Find my latest unread email and save it to a file'");
+    console.log("  • 'Search for recent news about AI and summarize it'");
     console.log("  • Type 'quit' or 'exit' to close");
   }
 
@@ -403,16 +396,25 @@ class EchoOrchestrator {
 
     const disconnectPromises = [
       this.fsClient?.close(),
-      this.gmailClient?.close()
+      this.gmailClient?.close(),
+      this.searchClient?.close() // --- NEW ---
     ].filter(Boolean);
 
     await Promise.allSettled(disconnectPromises);
 
     this.fsServerProcess?.kill();
     this.gmailServerProcess?.kill();
+    this.searchServerProcess?.kill(); // --- NEW ---
     
     this.isConnected = false;
     console.log("✅ All services disconnected");
+  }
+
+  /**
+   * Extracts text content from tool execution result
+   */
+  private extractResultText(result: any): string {
+    return (result.content as any)?.[0]?.text || JSON.stringify(result);
   }
 
   /**
@@ -420,33 +422,46 @@ class EchoOrchestrator {
    */
   private getSystemPrompt(): string {
     const toolList = this.tools
-      .map(tool => `- ${tool.name}: ${tool.description}`)
+      .map(tool => `- ${tool.name} (${tool.source}): ${tool.description}`)
       .join('\n');
 
-    return `You are "Echo," a powerful AI executive assistant. Your goal is to help users by executing tasks across different services. You have access to tools for local file operations and email management.
-
-EXECUTION PROCESS:
-1. Think step-by-step to create a plan
-2. Identify the correct tool(s) from the available list
-3. Chain tools together when tasks require multiple steps
-4. Execute the plan by calling necessary tools in sequence
-
-CRITICAL WORKFLOWS:
-**Email Drafting (RAG & Quality Check):**
-When drafting email replies, follow this exact sequence:
-1. Use 'list_emails' with search query to find the email thread
-2. Use 'read_email' with message ID to get full content
-3. Formulate draft content mentally (DO NOT call create_draft yet)
-4. **MANDATORY:** Call 'quality_check' tool with draft content
-5. **Analyze result:**
-   - If 'OK': proceed to create draft
-   - If 'REJECTED': stop and inform user about quality issues
-6. If quality check passed, use 'create_draft' tool
+    return `You are "Echo," a powerful AI executive assistant with advanced reasoning capabilities. Your goal is to help users by executing tasks across different services using a systematic approach.
 
 AVAILABLE TOOLS:
 ${toolList}
 
-Always summarize what you have accomplished after completing tasks.`;
+CORE CAPABILITIES:
+- File Operations: Create, read, write, and manage local files
+- Email Management: Read, send, search, and manage emails
+- Web Search: Find current information, research topics, and get real-time data
+
+EXECUTION APPROACH:
+1. **Analyze** the user's request carefully
+2. **Plan** the sequence of actions needed
+3. **Execute** tools in the optimal order
+4. **Verify** results and provide clear feedback
+5. **Summarize** what was accomplished
+
+CRITICAL WORKFLOWS:
+**Email Drafting (RAG & Quality Check):**
+When drafting email replies, follow this sequence:
+1. Use 'list_emails' to find the email thread
+2. Use 'read_email' to get full content
+3. Use 'quality_check' tool with draft content before creating
+4. Only create draft if quality check passes
+
+**Research Tasks:**
+1. Use search tools to gather current information
+2. Cross-reference multiple sources when possible
+3. Summarize findings clearly
+4. Save important information to files if requested
+
+**Multi-step Tasks:**
+- Break complex requests into logical steps
+- Use intermediate results to inform next actions
+- Provide progress updates for long-running tasks
+
+Always be helpful, accurate, and efficient. If you're unsure about something, ask for clarification rather than making assumptions.`;
   }
 }
 
@@ -483,6 +498,7 @@ async function main(): Promise<void> {
   const serviceConfig: ServiceConfig = {
     fsServerPath: path.resolve(process.cwd(), CONFIG.SERVER_PATHS.FILESYSTEM),
     gmailServerPath: path.resolve(process.cwd(), CONFIG.SERVER_PATHS.GMAIL),
+    searchServerPath: path.resolve(process.cwd(), CONFIG.SERVER_PATHS.SEARCH), // --- NEW ---
     fsRoot: path.resolve(process.cwd(), CONFIG.WORKSPACE_DIR)
   };
 
